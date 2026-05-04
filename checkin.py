@@ -9,6 +9,8 @@ import os
 import sys
 import json
 import base64
+import hashlib
+import time
 import requests
 from datetime import datetime
 from typing import Optional
@@ -85,6 +87,7 @@ class NewAPICheckin:
             self.user_id = self._extract_user_id_from_session(session_cookie)
             if self.user_id:
                 self.session.headers.update({'new-api-user': str(self.user_id)})
+        self.checkin_nonce = ''
 
     def _extract_user_id_from_session(self, session_cookie: str) -> Optional[str]:
         """
@@ -206,7 +209,31 @@ class NewAPICheckin:
         }
 
         try:
-            resp = self.session.post(f'{self.base_url}/api/user/checkin', timeout=30)
+            # 某些二开站点（如 huaibao）要求签到签名头：
+            # 1. 先通过用户信息接口确认 user_id
+            # 2. 再通过签到历史接口获取 checkin_nonce
+            # 3. 用 sha256(user_id:timestamp:checkin_nonce) 生成签名
+            if not self.user_id:
+                user_info = self.get_user_info()
+                if not user_info:
+                    result['message'] = '认证失败: 无法获取用户信息或 Session 已过期'
+                    return result
+
+            status = self.get_checkin_history()
+            if status:
+                self.checkin_nonce = status.get('checkin_nonce', self.checkin_nonce)
+
+            headers = {}
+            if self.user_id and self.checkin_nonce:
+                timestamp = str(int(time.time()))
+                signature_raw = f'{self.user_id}:{timestamp}:{self.checkin_nonce}'
+                signature = hashlib.sha256(signature_raw.encode('utf-8')).hexdigest()
+                headers.update({
+                    'X-Checkin-Timestamp': timestamp,
+                    'X-Checkin-Signature': signature,
+                })
+
+            resp = self.session.post(f'{self.base_url}/api/user/checkin', headers=headers, timeout=30)
 
             # 先检查状态码
             if resp.status_code == 401:
@@ -265,7 +292,10 @@ class NewAPICheckin:
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get('success'):
-                    return data.get('data')
+                    status_data = data.get('data')
+                    if status_data and status_data.get('checkin_nonce'):
+                        self.checkin_nonce = status_data['checkin_nonce']
+                    return status_data
             return None
         except Exception as e:
             print(f'[错误] 获取签到历史失败: {e}')
